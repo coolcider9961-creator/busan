@@ -1,0 +1,25 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = false
+enableCORS = false
+enableXsrfProtection = false
+
+[theme]
+base = "light"
+primaryColor = "#5B9BD5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#BFDBFE"
+textColor = "#334155"
+linkColor = "#4A90E2"
+dataframeHeaderBackgroundColor = "#F8FAFC"
+dataframeHeaderTextColor = "#475569"
+dataframeBorderColor = "#E2E8F0"
+font = "sans serif"
+
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#334155"
+primaryColor = "#5B9BD5"

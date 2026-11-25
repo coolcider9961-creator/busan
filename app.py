@@ -869,75 +869,6 @@ def _ensure_authenticated() -> tuple[bool, bool]:
     return False, False
 
 
-def _get_or_start_cloudflare_url(force_new: bool = False, port: int = 8501) -> str:
-    """Cloudflare 공식 고속 터널(data/cloudflared.exe)을 실행하거나 현재 활성 https://*.trycloudflare.com 링크를 반환한다."""
-    cf_bin = DATA_DIR / "cloudflared.exe"
-    log_file = DATA_DIR / "cloudflared.log"
-    share_file = DATA_DIR / "mobile_share_url.txt"
-
-    if not force_new and log_file.exists():
-        try:
-            txt = log_file.read_text(encoding="utf-8", errors="ignore")
-            matches = re.findall(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", txt)
-            if matches:
-                out = subprocess.check_output(
-                    ["tasklist", "/FI", "IMAGENAME eq cloudflared.exe", "/NH"],
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    encoding="cp949",
-                    errors="ignore",
-                )
-                if "cloudflared.exe" in out.lower():
-                    return matches[-1].strip()
-        except Exception:
-            pass
-
-    if not cf_bin.exists():
-        return ""
-
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "cloudflared.exe"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if log_file.exists():
-            log_file.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    subprocess.Popen(
-        [
-            str(cf_bin),
-            "tunnel",
-            "--url",
-            f"http://127.0.0.1:{port}",
-            "--no-autoupdate",
-            "--logfile",
-            str(log_file),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-
-    for _ in range(24):
-        time.sleep(0.4)
-        if log_file.exists():
-            try:
-                txt = log_file.read_text(encoding="utf-8", errors="ignore")
-                matches = re.findall(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", txt)
-                if matches:
-                    url = matches[-1].strip()
-                    share_file.write_text(url, encoding="utf-8")
-                    return url
-            except Exception:
-                pass
-    return ""
-
-
 def _render_sidebar(is_admin: bool, current_zone: str) -> str:
     st.sidebar.markdown(
         """
@@ -1093,14 +1024,9 @@ def _render_sidebar(is_admin: bool, current_zone: str) -> str:
             '<div class="sidebar-section-pill"><span>SHARE LINK · 카톡 외부 공유 링크</span><span>▾</span></div>',
             unsafe_allow_html=True,
         )
-        cf_url = _get_or_start_cloudflare_url(force_new=False, port=8501)
-        if st.sidebar.button("새 공유 링크 발급", width="stretch", key="btn_cf_refresh"):
-            with st.sidebar.status("Cloudflare 고속 링크 발급 중...", expanded=False):
-                cf_url = _get_or_start_cloudflare_url(force_new=True, port=8501)
-            st.rerun()
-        if cf_url:
-            st.sidebar.code(cf_url, language=None)
-            st.sidebar.caption("위 주소를 복사해 카카오톡으로 보내면 PC·휴대폰 어디서나 즉시 열립니다.")
+        official_share_url = get_env("PUBLIC_SHARE_URL", "https://dhbusan.streamlit.app")
+        st.sidebar.code(official_share_url, language=None)
+        st.sidebar.caption("위 24시간 고정 주소를 복사해 카카오톡으로 보내면 PC·휴대폰 어디서나 즉시 열립니다.")
     else:
         st.sidebar.write("")
         with st.sidebar.expander("🔒 관리자 모드", expanded=False):

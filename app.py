@@ -142,7 +142,11 @@ def _inject_modern_css() -> None:
         @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css');
 
         :root {
+            color-scheme: light !important;
             --primary-color: #5B9BD5 !important;
+            --background-color: #FFFFFF !important;
+            --secondary-background-color: #F8FAFC !important;
+            --text-color: #334155 !important;
             --font-sans: 'Plus Jakarta Sans', 'Pretendard Variable', 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
             --font-brand: 'Nunito', 'Plus Jakarta Sans', 'Pretendard Variable', sans-serif;
         }
@@ -238,13 +242,22 @@ def _inject_modern_css() -> None:
         /* 입력창·셀렉트박스·익스팬더·폼을 AirROI 화이트 필(Pill) 스타일로 고정 */
         div[data-baseweb="select"] > div,
         div[data-baseweb="input"],
-        div[data-baseweb="base-input"] {
+        div[data-baseweb="base-input"],
+        div[data-baseweb="popover"] ul,
+        ul[role="listbox"] {
             background-color: #FFFFFF !important;
             border: 1px solid #E2E8F0 !important;
             border-radius: 9px !important;
             color: #334155 !important;
             box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03) !important;
             transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
+        }
+        div[data-baseweb="select"] span,
+        div[data-baseweb="select"] input,
+        div[data-baseweb="input"] input,
+        div[role="radiogroup"] label p,
+        ul[role="listbox"] li {
+            color: #334155 !important;
         }
         div[data-baseweb="select"] > div:hover,
         div[data-baseweb="input"]:hover {

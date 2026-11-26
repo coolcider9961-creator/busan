@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-from src.config import DB_PATH
+import requests
+
+from src.config import DATA_DIR, DB_PATH, get_env
+
+LAST_SYNC_META_PATH = DATA_DIR / "last_sync.json"
+_LAST_GITHUB_PULL_CHECK_TS: float = 0.0
 
 
 def utc_now_iso() -> str:
@@ -465,3 +473,339 @@ def clear_demo_data(db_path: Path = DB_PATH) -> None:
         conn.execute("DELETE FROM airbnb_listings WHERE is_demo = 1;")
         conn.execute("DELETE FROM public_businesses WHERE is_demo = 1;")
         conn.execute("DELETE FROM collection_runs WHERE run_type LIKE 'demo%';")
+
+
+def flush_db_wal(db_path: Path = DB_PATH) -> None:
+    """SQLite WAL 트랜잭션을 메인 DB 파일(.db)로 완전 병합(TRUNCATE)한다."""
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def push_files_to_github(
+    files_map: Dict[str, bytes],
+    commit_message: str = "데이터베이스 및 설정 자동 동기화",
+    repo: Optional[str] = None,
+    branch: str = "main",
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """GitHub Git Data REST API를 통해 대용량 바이너리(.db 포함) 및 파일들을 원격 저장소에 즉시 커밋·푸시한다."""
+    gh_token = (token or get_env("GITHUB_TOKEN", "")).strip()
+    gh_repo = (repo or get_env("GITHUB_REPO", "coolcider9961-creator/busan")).strip()
+    if not gh_token:
+        return {"synced": False, "reason": "GITHUB_TOKEN 미설정"}
+    if not gh_repo or "/" not in gh_repo:
+        return {"synced": False, "reason": f"유효하지 않은 GITHUB_REPO: {gh_repo}"}
+
+    api_base = f"https://api.github.com/repos/{gh_repo}"
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        ref_resp = requests.get(f"{api_base}/git/refs/heads/{branch}", headers=headers, timeout=15)
+        ref_resp.raise_for_status()
+        latest_commit_sha = ref_resp.json()["object"]["sha"]
+
+        commit_resp = requests.get(
+            f"{api_base}/git/commits/{latest_commit_sha}", headers=headers, timeout=15
+        )
+        commit_resp.raise_for_status()
+        base_tree_sha = commit_resp.json()["tree"]["sha"]
+
+        tree_items: List[Dict[str, Any]] = []
+        blob_shas: Dict[str, str] = {}
+        for rel_path, content_bytes in files_map.items():
+            b64_content = base64.b64encode(content_bytes).decode("ascii")
+            blob_resp = requests.post(
+                f"{api_base}/git/blobs",
+                headers=headers,
+                json={"content": b64_content, "encoding": "base64"},
+                timeout=60,
+            )
+            blob_resp.raise_for_status()
+            blob_sha = blob_resp.json()["sha"]
+            blob_shas[rel_path] = blob_sha
+            tree_items.append(
+                {
+                    "path": rel_path.replace("\\", "/"),
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob_sha,
+                }
+            )
+
+        tree_resp = requests.post(
+            f"{api_base}/git/trees",
+            headers=headers,
+            json={"base_tree": base_tree_sha, "tree": tree_items},
+            timeout=30,
+        )
+        tree_resp.raise_for_status()
+        new_tree_sha = tree_resp.json()["sha"]
+
+        new_commit_resp = requests.post(
+            f"{api_base}/git/commits",
+            headers=headers,
+            json={
+                "message": commit_message,
+                "tree": new_tree_sha,
+                "parents": [latest_commit_sha],
+            },
+            timeout=20,
+        )
+        new_commit_resp.raise_for_status()
+        new_commit_sha = new_commit_resp.json()["sha"]
+
+        update_ref_resp = requests.patch(
+            f"{api_base}/git/refs/heads/{branch}",
+            headers=headers,
+            json={"sha": new_commit_sha, "force": True},
+            timeout=15,
+        )
+        update_ref_resp.raise_for_status()
+
+        return {
+            "synced": True,
+            "repo": gh_repo,
+            "branch": branch,
+            "commit_sha": new_commit_sha,
+            "blob_shas": blob_shas,
+        }
+    except Exception as exc:
+        return {"synced": False, "reason": str(exc)}
+
+
+def sync_db_to_github(
+    commit_message: str = "데이터베이스 자동 동기화",
+    db_path: Path = DB_PATH,
+) -> Dict[str, Any]:
+    """로컬/클라우드 SQLite 변경사항을 WAL 병합 후 GitHub 원격 저장소(data/busan_hostel_intel.db)에 실시간 반영한다."""
+    if not db_path.exists():
+        return {"synced": False, "reason": "DB 파일 없음"}
+
+    flush_db_wal(db_path)
+    db_bytes = db_path.read_bytes()
+    db_sha256 = hashlib.sha256(db_bytes).hexdigest()
+    now_iso = utc_now_iso()
+
+    meta_payload: Dict[str, Any] = {
+        "synced_at": now_iso,
+        "db_sha256": db_sha256,
+        "db_size": len(db_bytes),
+        "message": commit_message,
+    }
+    try:
+        LAST_SYNC_META_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAST_SYNC_META_PATH.write_text(
+            json.dumps(meta_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    gh_token = get_env("GITHUB_TOKEN", "").strip()
+    gh_repo = get_env("GITHUB_REPO", "coolcider9961-creator/busan").strip()
+    if not gh_token:
+        return {"synced": False, "reason": "GITHUB_TOKEN 미설정 (로컬 DB만 저장됨)"}
+
+    # 1차로 DB Blob을 업로드해 blob_sha를 메타에 기록하고, 단일 커밋으로 DB와 last_sync.json을 함께 푸시
+    api_base = f"https://api.github.com/repos/{gh_repo}"
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        ref_resp = requests.get(f"{api_base}/git/refs/heads/main", headers=headers, timeout=15)
+        ref_resp.raise_for_status()
+        latest_commit_sha = ref_resp.json()["object"]["sha"]
+
+        commit_resp = requests.get(
+            f"{api_base}/git/commits/{latest_commit_sha}", headers=headers, timeout=15
+        )
+        commit_resp.raise_for_status()
+        base_tree_sha = commit_resp.json()["tree"]["sha"]
+
+        b64_db = base64.b64encode(db_bytes).decode("ascii")
+        db_blob_resp = requests.post(
+            f"{api_base}/git/blobs",
+            headers=headers,
+            json={"content": b64_db, "encoding": "base64"},
+            timeout=60,
+        )
+        db_blob_resp.raise_for_status()
+        db_blob_sha = db_blob_resp.json()["sha"]
+
+        meta_payload["db_blob_sha"] = db_blob_sha
+        meta_bytes = json.dumps(meta_payload, ensure_ascii=False, indent=2).encode("utf-8")
+        try:
+            LAST_SYNC_META_PATH.write_bytes(meta_bytes)
+        except Exception:
+            pass
+
+        b64_meta = base64.b64encode(meta_bytes).decode("ascii")
+        meta_blob_resp = requests.post(
+            f"{api_base}/git/blobs",
+            headers=headers,
+            json={"content": b64_meta, "encoding": "base64"},
+            timeout=20,
+        )
+        meta_blob_resp.raise_for_status()
+        meta_blob_sha = meta_blob_resp.json()["sha"]
+
+        tree_resp = requests.post(
+            f"{api_base}/git/trees",
+            headers=headers,
+            json={
+                "base_tree": base_tree_sha,
+                "tree": [
+                    {
+                        "path": "data/busan_hostel_intel.db",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": db_blob_sha,
+                    },
+                    {
+                        "path": "data/last_sync.json",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": meta_blob_sha,
+                    },
+                ],
+            },
+            timeout=25,
+        )
+        tree_resp.raise_for_status()
+        new_tree_sha = tree_resp.json()["sha"]
+
+        new_commit_resp = requests.post(
+            f"{api_base}/git/commits",
+            headers=headers,
+            json={
+                "message": commit_message,
+                "tree": new_tree_sha,
+                "parents": [latest_commit_sha],
+            },
+            timeout=20,
+        )
+        new_commit_resp.raise_for_status()
+        new_commit_sha = new_commit_resp.json()["sha"]
+
+        update_ref_resp = requests.patch(
+            f"{api_base}/git/refs/heads/main",
+            headers=headers,
+            json={"sha": new_commit_sha, "force": True},
+            timeout=15,
+        )
+        update_ref_resp.raise_for_status()
+
+        return {
+            "synced": True,
+            "commit_sha": new_commit_sha,
+            "db_sha256": db_sha256,
+            "synced_at": now_iso,
+        }
+    except Exception as exc:
+        return {"synced": False, "reason": str(exc)}
+
+
+def pull_latest_db_from_github_if_newer(
+    db_path: Path = DB_PATH,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """원격 GitHub 저장소의 최신 DB 메타데이터(data/last_sync.json)를 확인해 더 최신이면 즉시 로컬/클라우드 DB를 갱신한다."""
+    global _LAST_GITHUB_PULL_CHECK_TS
+
+    if db_path != DB_PATH:
+        return {"updated": False, "reason": "non-default db"}
+
+    now_ts = time.time()
+    if not force and (now_ts - _LAST_GITHUB_PULL_CHECK_TS) < 12.0:
+        return {"updated": False, "reason": "throttled"}
+    _LAST_GITHUB_PULL_CHECK_TS = now_ts
+
+    gh_repo = get_env("GITHUB_REPO", "coolcider9961-creator/busan").strip()
+    gh_token = get_env("GITHUB_TOKEN", "").strip()
+    if not gh_repo or "/" not in gh_repo:
+        return {"updated": False, "reason": "invalid repo"}
+
+    headers: Dict[str, str] = {
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    api_base = f"https://api.github.com/repos/{gh_repo}"
+    try:
+        meta_resp = requests.get(
+            f"{api_base}/contents/data/last_sync.json?ref=main",
+            headers=headers,
+            timeout=3.5,
+        )
+        if meta_resp.status_code != 200:
+            return {"updated": False, "reason": f"meta status {meta_resp.status_code}"}
+        remote_meta = meta_resp.json()
+        remote_sha = str(remote_meta.get("db_sha256", "")).strip()
+        remote_blob_sha = str(remote_meta.get("db_blob_sha", "")).strip()
+        remote_synced_at = str(remote_meta.get("synced_at", "")).strip()
+        if not remote_sha or not remote_blob_sha:
+            return {"updated": False, "reason": "incomplete remote meta"}
+
+        local_synced_at = ""
+        local_sha = ""
+        if LAST_SYNC_META_PATH.exists():
+            try:
+                local_meta = json.loads(LAST_SYNC_META_PATH.read_text(encoding="utf-8"))
+                local_synced_at = str(local_meta.get("synced_at", "")).strip()
+                local_sha = str(local_meta.get("db_sha256", "")).strip()
+            except Exception:
+                pass
+        if not local_sha and db_path.exists():
+            flush_db_wal(db_path)
+            local_sha = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        if remote_sha == local_sha:
+            return {"updated": False, "reason": "already up-to-date", "synced_at": remote_synced_at}
+        if local_synced_at and remote_synced_at and remote_synced_at <= local_synced_at:
+            return {"updated": False, "reason": "local is newer or equal", "synced_at": local_synced_at}
+
+        blob_resp = requests.get(
+            f"{api_base}/git/blobs/{remote_blob_sha}",
+            headers=headers,
+            timeout=30.0,
+        )
+        blob_resp.raise_for_status()
+        new_db_bytes = blob_resp.content
+        if hashlib.sha256(new_db_bytes).hexdigest() != remote_sha:
+            return {"updated": False, "reason": "sha256 mismatch"}
+
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # 기존 WAL/SHM 임시파일이 있으면 정리 후 원자적 교체
+        for suffix in ("-wal", "-shm"):
+            wal_file = db_path.with_name(db_path.name + suffix)
+            if wal_file.exists():
+                try:
+                    wal_file.unlink()
+                except Exception:
+                    pass
+        tmp_path = db_path.with_suffix(".db.tmp")
+        tmp_path.write_bytes(new_db_bytes)
+        tmp_path.replace(db_path)
+        LAST_SYNC_META_PATH.write_text(
+            json.dumps(remote_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {"updated": True, "synced_at": remote_synced_at, "db_sha256": remote_sha}
+    except Exception as exc:
+        return {"updated": False, "reason": str(exc)}

@@ -53,6 +53,7 @@ from src.collectors.tourism_datalab import (
 )
 from src.config import (
     DATA_DIR,
+    DB_PATH,
     INDUSTRY_HOSTEL,
     INDUSTRY_URBAN_MINBAK,
     ZONES,
@@ -60,7 +61,13 @@ from src.config import (
     save_env_values,
     verify_access_password,
 )
-from src.db.database import get_conn, init_db
+from src.db.database import (
+    LAST_SYNC_META_PATH,
+    get_conn,
+    init_db,
+    pull_latest_db_from_github_if_newer,
+    sync_db_to_github,
+)
 from src.db.queries import (
     export_excel_bytes,
     get_collection_runs_df,
@@ -89,18 +96,26 @@ def _ensure_db_initialized() -> bool:
 _ensure_db_initialized()
 
 
+def _get_db_cache_token() -> float:
+    """DB 파일 수정 시각(mtime)을 캐시 키에 포함하여 로컬·클라우드 DB가 갱신되는 즉시(0초) 일반모드 화면에 반영한다."""
+    try:
+        return round(DB_PATH.stat().st_mtime, 3) if DB_PATH.exists() else 0.0
+    except Exception:
+        return 0.0
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_export_excel(zone_key: str, _v: int = 10) -> bytes:
+def _cached_export_excel(zone_key: str, _db_ts: float = 0.0, _v: int = 11) -> bytes:
     return export_excel_bytes(zone_key)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_zone_overview(zone_key: str, _v: int = 10) -> Dict[str, Any]:
+def _cached_zone_overview(zone_key: str, _db_ts: float = 0.0, _v: int = 11) -> Dict[str, Any]:
     return get_zone_overview(zone_key)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_competitor_df(zone_key: str, _v: int = 10) -> pd.DataFrame:
+def _cached_competitor_df(zone_key: str, _db_ts: float = 0.0, _v: int = 11) -> pd.DataFrame:
     df = get_competitor_df(zone_key)
     if not df.empty and ("thumbnail_url" not in df.columns or df["thumbnail_url"].isna().all()):
         with get_conn() as conn:
@@ -114,7 +129,7 @@ def _cached_competitor_df(zone_key: str, _v: int = 10) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_public_businesses_df(zone_key: str, _v: int = 10) -> pd.DataFrame:
+def _cached_public_businesses_df(zone_key: str, _db_ts: float = 0.0, _v: int = 11) -> pd.DataFrame:
     df = get_public_businesses_df(zone_key)
     if not df.empty and ("matched_thumbnail_url" not in df.columns or df["matched_thumbnail_url"].isna().all()):
         with get_conn() as conn:
@@ -1016,7 +1031,26 @@ def _render_sidebar(is_admin: bool, current_zone: str) -> str:
                 st.write("4) 고객층 및 포지셔닝 분석 중...")
                 analyzed = analyze_all_listings(zone_key="all", use_ai=bool(get_env("GEMINI_API_KEY")))
                 st.write(f"   → {analyzed['total']}개 객실 분석 완료")
-                status.update(label="동기화 완료", state="complete")
+
+                st.write("5) 클라우드(GitHub · 일반모드) 실시간 DB 동기화 중...")
+                gh_sync = sync_db_to_github("데이터 업데이트 실행 자동 동기화")
+                if gh_sync.get("synced"):
+                    st.write(f"   → 클라우드(dhbusan.streamlit.app) 실시간 반영 완료 ({str(gh_sync.get('commit_sha', ''))[:7]})")
+                else:
+                    st.write(f"   → 로컬 DB 반영 완료 (클라우드 동기화: {gh_sync.get('reason')})")
+                status.update(label="동기화 및 실시간 반영 완료", state="complete")
+            st.cache_data.clear()
+            st.rerun()
+
+        if st.sidebar.button("☁️ 현재 DB 클라우드 즉시 동기화", width="stretch", type="secondary"):
+            with st.sidebar.status("클라우드(GitHub) DB 동기화 중...", expanded=True) as sync_status:
+                gh_sync = sync_db_to_github("수동 클라우드 DB 즉시 동기화")
+                if gh_sync.get("synced"):
+                    st.write(f"클라우드(dhbusan.streamlit.app) 동기화 완료 ({str(gh_sync.get('commit_sha', ''))[:7]})")
+                    sync_status.update(label="클라우드 동기화 완료", state="complete")
+                else:
+                    st.error(f"동기화 실패: {gh_sync.get('reason')}")
+                    sync_status.update(label="동기화 실패", state="error")
             st.cache_data.clear()
             st.rerun()
 
@@ -1201,7 +1235,7 @@ def _render_top_filter_bar() -> tuple[str, List[str], bool]:
                 default=industry_choices,
                 key="top_industry_multiselect",
             )
-            xlsx_bytes = _cached_export_excel(selected_zone)
+            xlsx_bytes = _cached_export_excel(selected_zone, _db_ts=_get_db_cache_token())
             st.download_button(
                 label="엑셀 리포트 다운로드 (.xlsx)",
                 data=xlsx_bytes,
@@ -1233,7 +1267,7 @@ def _render_top_filter_bar() -> tuple[str, List[str], bool]:
                 st.rerun()
         with t_col4:
             st.write("")
-            xlsx_bytes = _cached_export_excel(selected_zone)
+            xlsx_bytes = _cached_export_excel(selected_zone, _db_ts=_get_db_cache_token())
             st.download_button(
                 label="엑셀 리포트 다운로드 (.xlsx)",
                 data=xlsx_bytes,
@@ -2092,7 +2126,9 @@ def _render_competitors_tab(comp_df: pd.DataFrame, pub_df: pd.DataFrame, is_admi
                         public_id=pid,
                         memo=input_memo,
                     )
-                    st.success(f"숙소 ID ({lid}) 등록, 공공상호 매칭 및 30일 달력·기본가 수집이 완료되었습니다.")
+                    gh_sync = sync_db_to_github(f"에어비앤비 URL 등록 및 매칭 ({lid})")
+                    sync_note = " (클라우드 일반모드 실시간 동기화 완료)" if gh_sync.get("synced") else ""
+                    st.success(f"숙소 ID ({lid}) 등록, 공공상호 매칭 및 30일 달력·기본가 수집이 완료되었습니다{sync_note}.")
                     st.cache_data.clear()
                     st.rerun()
                 except Exception as exc:
@@ -2118,20 +2154,22 @@ def _render_competitors_tab(comp_df: pd.DataFrame, pub_df: pd.DataFrame, is_admi
                 b1, b2 = st.columns(2)
                 if b1.button("매칭 확정", width="stretch"):
                     set_manual_match(pub_options[sel_pub_label], listing_map[sel_listing_label])
-                    st.success("수동 매칭을 저장했습니다.")
+                    sync_db_to_github(f"수동 매칭 확정 ({listing_map[sel_listing_label]})")
+                    st.success("수동 매칭을 저장하고 클라우드에 동기화했습니다.")
                     st.cache_data.clear()
                     st.rerun()
                 if b2.button("매칭 해제", width="stretch"):
                     clear_match(listing_map[sel_listing_label])
-                    st.warning("매칭을 해제했습니다.")
+                    sync_db_to_github(f"수동 매칭 해제 ({listing_map[sel_listing_label]})")
+                    st.warning("매칭을 해제하고 클라우드에 동기화했습니다.")
                     st.cache_data.clear()
                     st.rerun()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _get_prepared_comparison_pool(selected_zone: str, ind_choice: str, _v: int = 5) -> pd.DataFrame:
+def _get_prepared_comparison_pool(selected_zone: str, ind_choice: str, _db_ts: float = 0.0, _v: int = 6) -> pd.DataFrame:
     """비교 탭 전용 숙소 풀과 짧고 깔끔한 검색 라벨을 캐싱하여 0.01초 내에 반환한다."""
-    full_df = _cached_competitor_df("all").copy()
+    full_df = _cached_competitor_df("all", _db_ts=_db_ts).copy()
     if full_df.empty:
         return full_df
 
@@ -2194,7 +2232,7 @@ def _render_property_search_selector(
             key=f"{tab_prefix}_ind_filter",
         )
 
-    full_df = _get_prepared_comparison_pool(selected_zone, ind_choice)
+    full_df = _get_prepared_comparison_pool(selected_zone, ind_choice, _db_ts=_get_db_cache_token())
     if full_df.empty:
         return pd.DataFrame()
 
@@ -2705,7 +2743,8 @@ def _render_inbound_trend_tab(selected_zone: str, overview: Dict[str, Any], is_a
                 if st.button("공공데이터포털 관광빅데이터 API 동기화 실행", type="primary", width="stretch"):
                     try:
                         res = sync_tourism_visitors_from_api(days_back=int(days_opt))
-                        st.success(f"관광빅데이터 API 동기화 완료: {res['start_ymd']}~{res['end_ymd']} ({res['saved']}건 반영)")
+                        sync_db_to_github("한국관광 데이터랩 OpenAPI 동기화")
+                        st.success(f"관광빅데이터 API 동기화 및 클라우드 반영 완료: {res['start_ymd']}~{res['end_ymd']} ({res['saved']}건 반영)")
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
@@ -2714,8 +2753,9 @@ def _render_inbound_trend_tab(selected_zone: str, overview: Dict[str, Any], is_a
                 if dl_csv is not None and st.button("데이터랩 CSV DB 반영하기", width="stretch"):
                     try:
                         res_c = import_datalab_csv(dl_csv.getvalue(), default_zone_key=selected_zone)
+                        sync_db_to_github("한국관광 데이터랩 CSV 업로드 반영")
                         st.success(
-                            f"데이터랩 CSV 반영 완료: 방문자수 {res_c['saved_visitors']}건 · 국적별 비중 {res_c['saved_nationality']}건"
+                            f"데이터랩 CSV 및 클라우드 반영 완료: 방문자수 {res_c['saved_visitors']}건 · 국적별 비중 {res_c['saved_nationality']}건"
                         )
                         st.rerun()
                     except Exception as exc:
@@ -2733,7 +2773,7 @@ def _render_settings_tab(selected_zone: str) -> None:
         with pw_c1:
             new_admin_pw = st.text_input(
                 "관리자모드 비밀번호 (ADMIN_PASSWORD)",
-                value=get_env("ADMIN_PASSWORD", "1234"),
+                value=get_env("ADMIN_PASSWORD", "stay9094$"),
                 type="password",
             )
         with pw_c2:
@@ -2773,6 +2813,11 @@ def _render_settings_tab(selected_zone: str) -> None:
                 "Apify 기본 발굴 Actor ID",
                 value=get_env("APIFY_AIRBNB_ACTOR", "tri_angle/airbnb-scraper"),
             )
+            github_token = st.text_input(
+                "GitHub 자동 동기화 토큰 (GITHUB_TOKEN - 클라우드 실시간 동기화용)",
+                value=get_env("GITHUB_TOKEN"),
+                type="password",
+            )
         with c2:
             gemini_key = st.text_input(
                 "Gemini API 키 (선택 - GEMINI_API_KEY)",
@@ -2784,6 +2829,10 @@ def _render_settings_tab(selected_zone: str) -> None:
                 value=get_env("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             )
             currency = st.selectbox("수집 통화", ["KRW", "USD"], index=0 if get_env("DEFAULT_CURRENCY", "KRW") == "KRW" else 1)
+            github_repo = st.text_input(
+                "GitHub 원격 저장소 (GITHUB_REPO)",
+                value=get_env("GITHUB_REPO", "coolcider9961-creator/busan"),
+            )
 
         if st.form_submit_button("API 설정 저장", type="primary"):
             save_env_values(
@@ -2794,9 +2843,11 @@ def _render_settings_tab(selected_zone: str) -> None:
                     "GEMINI_API_KEY": gemini_key,
                     "GEMINI_MODEL": gemini_model,
                     "DEFAULT_CURRENCY": currency,
+                    "GITHUB_TOKEN": github_token,
+                    "GITHUB_REPO": github_repo,
                 }
             )
-            st.success(".env 파일에 API 설정을 저장했습니다.")
+            st.success(".env 파일에 API 및 클라우드 동기화 설정을 저장했습니다.")
 
     st.divider()
     st.markdown('<div class="section-title">공공데이터 CSV / Apify JSON 수동 업로드</div>', unsafe_allow_html=True)
@@ -2814,8 +2865,10 @@ def _render_settings_tab(selected_zone: str) -> None:
             )
             purge_non_target_records()
             matched = run_auto_matching(zone_key="all")
+            gh_sync = sync_db_to_github(f"LOCALDATA CSV 반영 ({csv_industry})")
+            sync_note = " · 클라우드 실시간 동기화 완료" if gh_sync.get("synced") else ""
             st.cache_data.clear()
-            st.success(f"CSV 반영 완료: 전체 {res['total_rows']}행 중 5대 권역 {res['saved']}건 저장, {matched}건 자동 매칭")
+            st.success(f"CSV 반영 완료: 전체 {res['total_rows']}행 중 5대 권역 {res['saved']}건 저장, {matched}건 자동 매칭{sync_note}")
 
     with u2:
         st.markdown("**2) Apify JSON 결과 업로드 (숙소 목록 또는 30일 달력 JSON)**")
@@ -2833,10 +2886,12 @@ def _render_settings_tab(selected_zone: str) -> None:
             purge_non_target_records()
             matched = run_auto_matching(zone_key="all")
             analyzed = analyze_all_listings(zone_key="all", use_ai=bool(get_env("GEMINI_API_KEY")))
+            gh_sync = sync_db_to_github("Apify JSON 수동 업로드 반영")
+            sync_note = " · 클라우드 실시간 동기화 완료" if gh_sync.get("synced") else ""
             st.cache_data.clear()
             st.success(
                 f"JSON 반영 완료: 호스텔·외도민 {res['listings_saved']}건 반영, "
-                f"매칭 {matched}건, 고객층 분석 {analyzed['total']}건"
+                f"매칭 {matched}건, 고객층 분석 {analyzed['total']}건{sync_note}"
             )
 
     st.divider()
@@ -2904,6 +2959,10 @@ def _compute_filtered_overview(
 def main() -> None:
     _inject_modern_css()
     _init_mobile_view_from_user_agent()
+    pull_res = pull_latest_db_from_github_if_newer()
+    if pull_res.get("updated"):
+        st.cache_data.clear()
+
     can_view, is_admin = _ensure_authenticated()
     if not can_view:
         return
@@ -2941,9 +3000,10 @@ def main() -> None:
         st.warning("상단 '대상 업종' 필터에서 최소 1개 이상의 업종(호스텔업 또는 외국인관광도시민박업)을 선택해 주세요.")
         return
 
-    base_overview = _cached_zone_overview(selected_zone)
-    comp_df = _cached_competitor_df(selected_zone).copy()
-    pub_df = _cached_public_businesses_df(selected_zone).copy()
+    db_ts = _get_db_cache_token()
+    base_overview = _cached_zone_overview(selected_zone, _db_ts=db_ts)
+    comp_df = _cached_competitor_df(selected_zone, _db_ts=db_ts).copy()
+    pub_df = _cached_public_businesses_df(selected_zone, _db_ts=db_ts).copy()
 
     if not comp_df.empty:
         comp_df = comp_df[comp_df["industry_type"].isin(selected_industries)]

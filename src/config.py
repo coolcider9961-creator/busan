@@ -109,7 +109,7 @@ def get_env(name: str, default: str = "") -> str:
 def verify_access_password(input_pw: str) -> Optional[str]:
     """입력한 비밀번호를 검증해 권한('admin' | 'viewer' | None)을 반환한다."""
     pw = (input_pw or "").strip()
-    admin_pw = get_env("ADMIN_PASSWORD", "1234")
+    admin_pw = get_env("ADMIN_PASSWORD", "stay9094$")
     viewer_pw = get_env("VIEWER_PASSWORD", "")
 
     if admin_pw and pw == admin_pw:

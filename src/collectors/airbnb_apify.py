@@ -1234,86 +1234,126 @@ def fetch_single_room_direct(
                     is_super = 1 if ev.get("isSuperhost") else 0
                     zone_key = assign_zone(lat, lon)
 
-                    pubs = public_pubs_cache
-                    if pubs is None:
-                        with get_conn(db_path) as conn:
-                            pubs = [
-                                dict(r)
-                                for r in conn.execute(
-                                    "SELECT * FROM public_businesses WHERE status_name = '영업/정상'"
-                                ).fetchall()
-                            ]
-
-                    matched_pub = _match_public_business_by_brand_or_code(
-                        pubs=pubs,
-                        title=best_title,
-                        biz_name=reg_info.get("biz_name"),
-                        desc=full_desc,
-                        reg_info=reg_info,
-                        lat=lat,
-                        lon=lon,
-                    )
-
-                    ind_type = reg_info.get("industry_type")
-                    reg_formatted = reg_info.get("formatted")
-
-                    if matched_pub:
-                        ind_type = matched_pub["industry_type"]
-                        zone_key = matched_pub["zone_key"] or zone_key
-                        mng_d = re.sub(r"\D", "", str(matched_pub.get("mng_no") or ""))
-                        p_code = mng_d[-10:] if len(mng_d) >= 10 else (reg_info.get("norm_code") or "")
-                        reg_formatted = "|".join(
-                            [
-                                matched_pub.get("sigungu") or reg_info.get("sigungu") or "",
-                                ind_type,
-                                reg_info.get("permit_no") or matched_pub["business_name"],
-                                p_code,
-                            ]
-                        )
-
-                    if strict_filter:
-                        if zone_key not in ZONES:
-                            return result
-                        if ind_type not in (INDUSTRY_HOSTEL, INDUSTRY_URBAN_MINBAK):
-                            return result
-
-                    final_ind = ind_type if ind_type in (INDUSTRY_HOSTEL, INDUSTRY_URBAN_MINBAK) else INDUSTRY_URBAN_MINBAK
                     m_og_img = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html)
                     thumb_direct = (
                         str(sharing.get("imageUrl") or sharing.get("pictureUrl") or (m_og_img.group(1) if m_og_img else "") or "").strip()
                         or None
                     )
-                    with get_conn(db_path) as conn:
-                        upsert_airbnb_listing(
-                            conn,
-                            {
-                                "listing_id": str(listing_id),
-                                "title": best_title,
-                                "url": f"https://www.airbnb.co.kr/rooms/{listing_id}",
-                                "room_type": str(room_type) if room_type else None,
-                                "property_type": final_ind,
-                                "is_hostel_like": 1,
-                                "host_name": reg_info.get("biz_name"),
-                                "is_superhost": is_super,
-                                "capacity": cap_int,
-                                "bedrooms": None,
-                                "beds": None,
-                                "bathrooms": None,
-                                "rating": float(rating) if rating else None,
-                                "reviews_count": int(rev_cnt) if rev_cnt else 0,
-                                "recent_review_date": None,
-                                "operating_status": "예약 가능 (활성)",
-                                "registration_number": reg_formatted,
-                                "address_hint": matched_pub["road_address"] if matched_pub else None,
-                                "zone_key": zone_key or "gwangalli",
-                                "lat": lat,
-                                "lon": lon,
-                                "is_demo": 0,
-                                "extra_guest_fee_note": extra_fee,
-                                "thumbnail_url": thumb_direct,
-                            },
+                    rating_f = float(rating) if rating else None
+                    rev_cnt_i = int(rev_cnt) if rev_cnt else None
+
+                    if not strict_filter:
+                        with get_conn(db_path) as conn:
+                            cur = conn.execute(
+                                """
+                                UPDATE airbnb_listings
+                                SET title = COALESCE(?, title),
+                                    rating = COALESCE(?, rating),
+                                    reviews_count = CASE WHEN ? IS NOT NULL AND ? >= 0 THEN ? ELSE reviews_count END,
+                                    is_superhost = COALESCE(?, is_superhost),
+                                    capacity = COALESCE(?, capacity),
+                                    extra_guest_fee_note = COALESCE(?, extra_guest_fee_note),
+                                    thumbnail_url = COALESCE(?, thumbnail_url),
+                                    last_seen_at = ?
+                                WHERE listing_id = ?
+                                """,
+                                (
+                                    best_title if best_title and not best_title.startswith("숙소 ") else None,
+                                    rating_f,
+                                    rev_cnt_i,
+                                    rev_cnt_i,
+                                    rev_cnt_i,
+                                    is_super,
+                                    cap_int,
+                                    extra_fee,
+                                    thumb_direct,
+                                    utc_now_iso(),
+                                    str(listing_id),
+                                ),
+                            )
+                            if cur.rowcount > 0:
+                                result["saved_listing"] = True
+                                result["rating"] = rating_f
+                                result["reviews_count"] = rev_cnt_i
+
+                    if not result["saved_listing"]:
+                        pubs = public_pubs_cache
+                        if pubs is None:
+                            with get_conn(db_path) as conn:
+                                pubs = [
+                                    dict(r)
+                                    for r in conn.execute(
+                                        "SELECT * FROM public_businesses WHERE status_name = '영업/정상'"
+                                    ).fetchall()
+                                ]
+
+                        matched_pub = _match_public_business_by_brand_or_code(
+                            pubs=pubs,
+                            title=best_title,
+                            biz_name=reg_info.get("biz_name"),
+                            desc=full_desc,
+                            reg_info=reg_info,
+                            lat=lat,
+                            lon=lon,
                         )
-                        result["saved_listing"] = True
+
+                        ind_type = reg_info.get("industry_type")
+                        reg_formatted = reg_info.get("formatted")
+
+                        if matched_pub:
+                            ind_type = matched_pub["industry_type"]
+                            zone_key = matched_pub["zone_key"] or zone_key
+                            mng_d = re.sub(r"\D", "", str(matched_pub.get("mng_no") or ""))
+                            p_code = mng_d[-10:] if len(mng_d) >= 10 else (reg_info.get("norm_code") or "")
+                            reg_formatted = "|".join(
+                                [
+                                    matched_pub.get("sigungu") or reg_info.get("sigungu") or "",
+                                    ind_type,
+                                    reg_info.get("permit_no") or matched_pub["business_name"],
+                                    p_code,
+                                ]
+                            )
+
+                        if strict_filter:
+                            if zone_key not in ZONES:
+                                return result
+                            if ind_type not in (INDUSTRY_HOSTEL, INDUSTRY_URBAN_MINBAK):
+                                return result
+
+                        final_ind = ind_type if ind_type in (INDUSTRY_HOSTEL, INDUSTRY_URBAN_MINBAK) else INDUSTRY_URBAN_MINBAK
+                        with get_conn(db_path) as conn:
+                            upsert_airbnb_listing(
+                                conn,
+                                {
+                                    "listing_id": str(listing_id),
+                                    "title": best_title,
+                                    "url": f"https://www.airbnb.co.kr/rooms/{listing_id}",
+                                    "room_type": str(room_type) if room_type else None,
+                                    "property_type": final_ind,
+                                    "is_hostel_like": 1,
+                                    "host_name": reg_info.get("biz_name"),
+                                    "is_superhost": is_super,
+                                    "capacity": cap_int,
+                                    "bedrooms": None,
+                                    "beds": None,
+                                    "bathrooms": None,
+                                    "rating": rating_f,
+                                    "reviews_count": rev_cnt_i or 0,
+                                    "recent_review_date": None,
+                                    "operating_status": "예약 가능 (활성)",
+                                    "registration_number": reg_formatted,
+                                    "address_hint": matched_pub["road_address"] if matched_pub else None,
+                                    "zone_key": zone_key or "gwangalli",
+                                    "lat": lat,
+                                    "lon": lon,
+                                    "is_demo": 0,
+                                    "extra_guest_fee_note": extra_fee,
+                                    "thumbnail_url": thumb_direct,
+                                },
+                            )
+                            result["saved_listing"] = True
+                            result["rating"] = rating_f
+                            result["reviews_count"] = rev_cnt_i
         except Exception:
             if strict_filter:
                 return result
@@ -1416,38 +1456,48 @@ def fetch_single_room_direct(
 
 def sync_calendar_and_prices_direct(
     zone_key: str = "all",
-    max_items: int = 300,
+    max_items: int = 1500,
+    fetch_metadata: bool = True,
     fetch_weekend_price: bool = True,
     fetch_weekday_if_missing: bool = True,
-    max_workers: int = 4,
+    fetch_all_weekday_prices: bool = False,
+    matched_only: bool = False,
+    max_workers: int = 14,
     db_path: Path = DB_PATH,
 ) -> Dict[str, Any]:
-    """확정된 순수 호스텔업·외도민 숙소들의 향후 30일 달력 예약률과 주말/평일 호스트 기본가를 직접 수집한다."""
+    """확정된 순수 호스텔업·외도민 숙소들의 최신 평점·후기수, 향후 30일 달력 예약률, 주말/평일 호스트 기본가를 직접 수집한다."""
     started = utc_now_iso()
     today = date.today()
+    matched_clause = (
+        " AND EXISTS (SELECT 1 FROM business_listing_matches m WHERE m.listing_id = a.listing_id)"
+        if matched_only
+        else ""
+    )
     with get_conn(db_path) as conn:
         if zone_key and zone_key != "all":
             rows = conn.execute(
-                """
+                f"""
                 SELECT a.listing_id,
                        (SELECT COUNT(*) FROM price_snapshots p WHERE p.listing_id = a.listing_id AND p.snapshot_type = 'D+7_WEEKDAY') AS has_wd,
                        (SELECT COUNT(*) FROM price_snapshots p WHERE p.listing_id = a.listing_id AND p.snapshot_type = 'D+14_WEEKEND') AS has_we
                 FROM airbnb_listings a
-                WHERE a.is_hostel_like = 1 AND a.zone_key = ?
-                ORDER BY a.reviews_count DESC
+                WHERE a.is_hostel_like = 1 AND a.zone_key = ?{matched_clause}
+                ORDER BY (CASE WHEN EXISTS (SELECT 1 FROM business_listing_matches m WHERE m.listing_id = a.listing_id) THEN 0 ELSE 1 END),
+                         a.reviews_count DESC
                 LIMIT ?
                 """,
                 (zone_key, max_items),
             ).fetchall()
         else:
             rows = conn.execute(
-                """
+                f"""
                 SELECT a.listing_id,
                        (SELECT COUNT(*) FROM price_snapshots p WHERE p.listing_id = a.listing_id AND p.snapshot_type = 'D+7_WEEKDAY') AS has_wd,
                        (SELECT COUNT(*) FROM price_snapshots p WHERE p.listing_id = a.listing_id AND p.snapshot_type = 'D+14_WEEKEND') AS has_we
                 FROM airbnb_listings a
-                WHERE a.is_hostel_like = 1
-                ORDER BY a.reviews_count DESC
+                WHERE a.is_hostel_like = 1{matched_clause}
+                ORDER BY (CASE WHEN EXISTS (SELECT 1 FROM business_listing_matches m WHERE m.listing_id = a.listing_id) THEN 0 ELSE 1 END),
+                         a.reviews_count DESC
                 LIMIT ?
                 """,
                 (max_items,),
@@ -1457,13 +1507,14 @@ def sync_calendar_and_prices_direct(
         (
             str(r["listing_id"]),
             bool(fetch_weekend_price),
-            bool(fetch_weekday_if_missing and int(r["has_wd"] or 0) == 0),
+            bool(fetch_all_weekday_prices or (fetch_weekday_if_missing and int(r["has_wd"] or 0) == 0)),
         )
         for r in rows
     ]
     if not tasks:
-        return {"requested": 0, "updated": 0, "weekend_prices": 0}
+        return {"requested": 0, "meta_updated": 0, "updated": 0, "weekend_prices": 0}
 
+    meta_updated = 0
     cal_updated = 0
     we_updated = 0
 
@@ -1473,18 +1524,20 @@ def sync_calendar_and_prices_direct(
             return fetch_single_room_direct(
                 listing_id=lid,
                 reference_date=today,
-                fetch_metadata=False,
+                fetch_metadata=fetch_metadata,
                 fetch_weekend_price=do_we,
                 fetch_weekday_price=do_wd,
                 db_path=db_path,
             )
         except Exception:
-            return {"listing_id": lid, "calendar_updated": False, "weekend_price": None}
+            return {"listing_id": lid, "saved_listing": False, "calendar_updated": False, "weekend_price": None}
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(_worker, t) for t in tasks]
         for fut in as_completed(futures):
             res = fut.result()
+            if res.get("saved_listing"):
+                meta_updated += 1
             if res.get("calendar_updated"):
                 cal_updated += 1
             if res.get("weekend_price") is not None:
@@ -1496,11 +1549,18 @@ def sync_calendar_and_prices_direct(
             run_type="airbnb_calendar_30d",
             zone_key=zone_key,
             status="success",
-            records_count=cal_updated,
-            message=f"30일 달력 예약률 {cal_updated}건 · 주말 기본가 {we_updated}건 갱신 완료",
+            records_count=max(meta_updated, cal_updated),
+            message=(
+                f"평점·후기수 {meta_updated}건 · 30일 달력 예약률 {cal_updated}건 · 주말 기본가 {we_updated}건 갱신 완료"
+            ),
             started_at=started,
         )
-    return {"requested": len(tasks), "updated": cal_updated, "weekend_prices": we_updated}
+    return {
+        "requested": len(tasks),
+        "meta_updated": meta_updated,
+        "updated": cal_updated,
+        "weekend_prices": we_updated,
+    }
 
 
 def _scan_map_grid_cell(

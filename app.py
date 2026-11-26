@@ -38,6 +38,7 @@ from src.collectors.airbnb_apify import (
     register_tracked_airbnb_url,
     sync_airbnb_via_apify,
     sync_calendar_30d_via_apify,
+    sync_calendar_and_prices_direct,
 )
 from src.collectors.public_data import (
     import_localdata_csv,
@@ -969,13 +970,20 @@ def _render_sidebar(is_admin: bool, current_zone: str) -> str:
             '<div class="sidebar-section-pill"><span>DATA SYNC · 데이터 동기화</span><span>▾</span></div>',
             unsafe_allow_html=True,
         )
+        sync_scope_choice = st.sidebar.radio(
+            "업데이트 대상 상권",
+            options=["부산 5대 상권 전체", "현재 화면 선택 상권만"],
+            index=0,
+            horizontal=True,
+            key="sidebar_sync_scope_radio",
+        )
         run_calendar_now = st.sidebar.checkbox(
-            "Apify 30일 달력 예약률 갱신",
+            "실시간 평점·후기수 및 30일 달력 예약률 갱신",
             value=True,
-            help="확정된 순수 호스텔·외도민 객실 ID만 Apify에 전달하여 향후 14일/30일 달력 예약률을 갱신합니다.",
+            help="확정된 순수 호스텔·외도민 전체 객실의 에어비앤비 실시간 평점, 후기 개수, 향후 14일/30일 달력 예약률을 동시에 최신화합니다.",
         )
         run_price_now = st.sidebar.checkbox(
-            "Apify 평일·주말 기본가 갱신",
+            "평일·주말 호스트 기본 객단가 갱신",
             value=False,
             help="순수 호스텔·외도민 URL만 지정 호출하여 평일(D+7)/주말(D+14) 호스트 기본가를 수집합니다.",
         )
@@ -984,9 +992,9 @@ def _render_sidebar(is_admin: bool, current_zone: str) -> str:
             value=False,
             help="Apify로 상권을 스캔한 뒤 생숙·모텔은 즉시 버리고 신규 호스텔·외도민만 추가합니다.",
         )
-        max_listings_opt = st.sidebar.slider("최대 처리 객실 수", min_value=20, max_value=400, value=250, step=20)
+        max_listings_opt = st.sidebar.slider("최대 처리 객실 수", min_value=50, max_value=1500, value=900, step=50)
 
-        update_zone = "all" if current_zone == "all" else current_zone
+        update_zone = "all" if sync_scope_choice == "부산 5대 상권 전체" else ("all" if current_zone == "all" else current_zone)
         if st.sidebar.button("데이터 업데이트 실행", width="stretch", type="primary"):
             with st.sidebar.status("데이터 동기화 진행 중...", expanded=True) as status:
                 if get_env("DATA_GO_KR_API_KEY"):
@@ -1001,27 +1009,37 @@ def _render_sidebar(is_admin: bool, current_zone: str) -> str:
                         f"외도민 {res_pub['urban_minbak_count']}건 반영"
                     )
 
-                if (run_price_now or discover_new_opt) and get_env("APIFY_API_TOKEN"):
-                    st.write("2) Apify 평일·주말 호스트 기본가 수집 중...")
+                if discover_new_opt and get_env("APIFY_API_TOKEN"):
+                    st.write("2) Apify 신규 숙소 발굴 및 기본가 수집 중...")
                     apify_zone = "seomyeon" if update_zone == "all" else update_zone
                     res_air = sync_airbnb_via_apify(
                         zone_key=apify_zone,
-                        max_listings=max_listings_opt,
+                        max_listings=min(max_listings_opt, 400),
                         hostel_only=True,
                         weekend_also=True,
-                        targeted_urls_only=not discover_new_opt,
+                        targeted_urls_only=False,
                         fetch_calendar_30d=run_calendar_now,
                     )
-                    st.write(f"   → Apify 수집 완료: {res_air}")
-                elif run_calendar_now and get_env("APIFY_API_TOKEN"):
-                    st.write("2) Apify 향후 30일 달력 예약률 갱신 중...")
-                    res_cal = sync_calendar_30d_via_apify(
+                    st.write(f"   → Apify 신규 발굴 완료: {res_air}")
+
+                if run_calendar_now or run_price_now:
+                    st.write("2) 에어비앤비 실시간 평점·후기수·30일 달력 예약률 갱신 중...")
+                    res_direct = sync_calendar_and_prices_direct(
                         zone_key=update_zone,
                         max_items=max_listings_opt,
+                        fetch_metadata=True,
+                        fetch_weekend_price=run_price_now,
+                        fetch_weekday_if_missing=True,
+                        fetch_all_weekday_prices=run_price_now,
+                        matched_only=False,
+                        max_workers=14,
                     )
-                    st.write(f"   → 30일 달력 {res_cal.get('updated', 0)}건 반영")
-                else:
-                    st.write("2) Apify 호출 건너뜀 (기존 저장 데이터 유지)")
+                    st.write(
+                        f"   → 평점·후기수 {res_direct.get('meta_updated', 0)}건 · "
+                        f"30일 달력 {res_direct.get('updated', 0)}건 최신화 완료"
+                    )
+                elif not discover_new_opt:
+                    st.write("2) 에어비앤비 실시간 수집 건너뜀 (기존 저장 데이터 유지)")
 
                 st.write("3) 인허가 데이터 정제 및 상호 매칭 중...")
                 purge_non_target_records()

@@ -1460,7 +1460,7 @@ def _render_unified_table(
                 search_kw = st.text_input(
                     "🔍 상호명 · 숙소명 · 주소 검색",
                     value="",
-                    placeholder="상호명·도로명 (예: 무해, 광안린)",
+                    placeholder="상호명·도로명 (예: 땡땡스테이, 땡땡, 스테이 땡땡)",
                     key=f"{key_prefix}_kw",
                 ).strip()
             with r1_c2:
@@ -1528,7 +1528,7 @@ def _render_unified_table(
             search_kw = st.text_input(
                 "상호명 · 숙소명 · 주소 검색",
                 value="",
-                placeholder="상호명, 에어비앤비 숙소명, 도로명/동 입력 (예: 무해, 후추스테이, 광안린)",
+                placeholder="상호명, 에어비앤비 숙소명, 도로명/동 입력 (예: 땡땡스테이, 땡땡, 스테이 땡땡)",
                 key=f"{key_prefix}_kw",
             ).strip()
         with f5:
@@ -2275,7 +2275,7 @@ def _render_property_search_selector(
             f"비교할 숙소 검색 · 선택 (클릭 후 상호명 입력 · 최대 {max_count}곳)",
             options=all_labels,
             max_selections=max_count,
-            placeholder="비교할 숙소 이름을 입력하세요 (예: 무해, 후추스테이, 광안린, 연온담, 여온)",
+            placeholder="비교할 숙소 이름을 입력하세요 (예: 땡땡스테이, 땡땡, 스테이 땡땡)",
             key=state_key,
         )
 
@@ -2333,7 +2333,7 @@ def _render_price_tab(selected_zone: str, comp_df: pd.DataFrame) -> None:
         max_count=6,
     )
     if sel_df.empty:
-        st.info("위 선택창을 클릭해 비교할 숙소 이름(예: 무해, 후추스테이, 광안린, 연온담)을 입력해 선택해 주세요.")
+        st.info("위 선택창을 클릭해 비교할 숙소 이름(예: 땡땡스테이, 땡땡, 스테이 땡땡)을 입력해 선택해 주세요.")
         return
 
     sel_df["short_name"] = _build_unique_chart_labels(sel_df)
@@ -2484,7 +2484,7 @@ def _render_customers_tab(selected_zone: str, comp_df: pd.DataFrame) -> None:
         max_count=4,
     )
     if sel_df.empty:
-        st.info("위 선택창을 클릭해 비교할 숙소 이름(예: 무해, 후추스테이, 광안린, 연온담)을 입력해 선택해 주세요.")
+        st.info("위 선택창을 클릭해 비교할 숙소 이름(예: 땡땡스테이, 땡땡, 스테이 땡땡)을 입력해 선택해 주세요.")
         return
 
     sel_df["unique_chart_label"] = _build_unique_chart_labels(sel_df)
